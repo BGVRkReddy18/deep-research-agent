@@ -71,3 +71,56 @@ async def test_run_stops_early_with_clear_error_when_no_model_is_reachable():
         await research("How many centuries has Virat Kohli scored?", components=comps)
     assert "404" in str(info.value)
     assert comps.search.calls == 0  # no search quota wasted
+
+
+async def test_retriever_skips_embeddings_when_quota_wait_exceeds_budget():
+    """Deployed-app finding: workers stalled ~60s waiting for embedding quota."""
+
+    class BusyEmbedder(HashEmbedder):
+        calls = 0
+
+        def wait_time(self, texts):
+            return 45.0
+
+        async def embed(self, texts):
+            self.calls += 1
+            return await super().embed(texts)
+
+    emb = BusyEmbedder()
+    chunks = [Chunk(id=f"c{i}", url=f"https://s/{i}", title="t", text=f"solar cost fact {i}") for i in range(10)]
+    r = HybridRetriever(emb, InMemoryStore, max_dense_wait=8.0)
+    await r.index(chunks)
+    t = time.monotonic()
+    hits = await r.search(["solar cost"], k=3)
+    assert time.monotonic() - t < 1.0  # no stall
+    assert hits and emb.calls == 0  # BM25 only for this step
+    assert r.note and "keyword search" in r.note
+    assert r.dense_enabled  # not disabled for good: later steps may embed once quota frees up
+
+
+async def test_retry_gives_up_instead_of_exceeding_latency_budget():
+    import pytest
+
+    from research_agent.resilience import retry_async
+
+    calls = 0
+
+    async def rate_limited():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("429 quota exceeded. Please retry in 59.4s.")
+
+    t = time.monotonic()
+    with pytest.raises(RuntimeError):
+        await retry_async(rate_limited, attempts=3, max_wait=8.0, is_retryable=lambda e: True)
+    assert calls == 1 and time.monotonic() - t < 1.0
+
+
+def test_gemini_embedder_shares_quota_and_cache_across_runs():
+    from research_agent.rag.embeddings import GeminiEmbedder
+
+    a, b = GeminiEmbedder("same-key"), GeminiEmbedder("same-key")
+    assert a._text_limiter is b._text_limiter and a._cache is b._cache
+    assert GeminiEmbedder("other-key")._cache is not a._cache
+    a._cache["x" * 10] = None  # cached texts cost no quota
+    assert b.wait_time(["x" * 10]) == 0.0

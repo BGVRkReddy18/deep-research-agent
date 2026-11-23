@@ -47,8 +47,17 @@ def reciprocal_rank_fusion(rankings: list[list[str]], k: int = 60) -> dict[str, 
 
 
 class HybridRetriever:
-    def __init__(self, embedder: Embedder | None, store_factory: Callable[[], VectorStore]) -> None:
+    def __init__(
+        self,
+        embedder: Embedder | None,
+        store_factory: Callable[[], VectorStore],
+        max_dense_wait: float = 8.0,
+    ) -> None:
         self._embedder = embedder
+        # Latency budget: dense search is an enhancement on top of BM25, so if the embedding
+        # quota would make us wait longer than this, skip it for this search instead of stalling.
+        self.max_dense_wait = max_dense_wait
+        self.note: str | None = None
         self._store_factory = store_factory
         self._chunks: dict[str, Chunk] = {}
         self._order: list[str] = []
@@ -69,9 +78,12 @@ class HybridRetriever:
         best = sorted(range(len(self._order)), key=lambda i: -scores[i])[:top]
         return [self._order[i] for i in best if scores[i] > 0] or [self._order[i] for i in best]
 
+    def _texts(self, candidates: list[str]) -> list[str]:
+        return [f"{self._chunks[c].title}\n{self._chunks[c].text}" for c in candidates]
+
     async def _dense_rankings(self, queries: list[str], candidates: list[str], top: int) -> list[list[str]]:
         assert self._embedder is not None
-        texts = [f"{self._chunks[c].title}\n{self._chunks[c].text}" for c in candidates]
+        texts = self._texts(candidates)
         vectors = await self._embedder.embed(queries + texts)
         self.embedded += len(texts)
         store = self._store_factory()
@@ -86,7 +98,7 @@ class HybridRetriever:
         queries: str | list[str],
         k: int = 6,
         per_source_cap: int = 2,
-        candidates: int = 24,
+        candidates: int = 16,
     ) -> list[Chunk]:
         if isinstance(queries, str):
             queries = [queries]
@@ -99,6 +111,14 @@ class HybridRetriever:
 
         if self.dense_enabled:
             pool = list(dict.fromkeys(cid for r in rankings for cid in r))[:candidates]
+            wait_fn = getattr(self._embedder, "wait_time", None)
+            wait = wait_fn(queries + self._texts(pool)) if wait_fn else 0.0
+            if wait > self.max_dense_wait:
+                reason_fn = getattr(self._embedder, "unavailable_reason", None)
+                reason = (reason_fn() if reason_fn else None) or f"Embedding quota busy (~{wait:.0f}s wait)"
+                self.note = f"{reason}; used keyword search for this step."
+                log.info(self.note)
+                return self._diversify(reciprocal_rank_fusion(rankings), k, per_source_cap)
             try:
                 rankings += await self._dense_rankings(queries, pool, top=per_query)
             except Exception as exc:  # noqa: BLE001 - degrade to keyword-only retrieval
@@ -106,7 +126,10 @@ class HybridRetriever:
                 self.warning = f"Embedding failed ({type(exc).__name__}); used keyword search only."
                 self.dense_enabled = False
 
-        fused = reciprocal_rank_fusion(rankings)
+        return self._diversify(reciprocal_rank_fusion(rankings), k, per_source_cap)
+
+    def _diversify(self, fused: dict[str, float], k: int, per_source_cap: int) -> list[Chunk]:
+        """Best-first, but at most `per_source_cap` chunks per URL so one page can't dominate."""
         picked: list[Chunk] = []
         per_url: dict[str, int] = defaultdict(int)
         for cid in sorted(fused, key=lambda c: -fused[c]):

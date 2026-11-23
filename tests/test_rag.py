@@ -83,3 +83,35 @@ async def test_per_source_cap():
     await r.index(chunks)
     hits = await r.search("solar", k=5, per_source_cap=2)
     assert sum(h.url == "https://same" for h in hits) == 2
+
+
+def _onnx_model_cached() -> bool:
+    from pathlib import Path
+
+    return (Path.home() / ".cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx").exists()
+
+
+@pytest.mark.skipif(not _onnx_model_cached(), reason="local ONNX model not downloaded")
+async def test_onnx_embedder_ranks_semantic_match_first():
+    from research_agent.rag.embeddings import OnnxEmbedder
+
+    emb = OnnxEmbedder()
+    vecs = await emb.embed(["price of photovoltaic panels", "solar panel cost", "history of the Roman empire"])
+    assert vecs.shape == (3, 384)
+    assert float(vecs[0] @ vecs[1]) > float(vecs[0] @ vecs[2])  # paraphrase beats unrelated text
+    assert emb.wait_time(["x"]) == 0.0 and emb.unavailable_reason() is None
+
+
+async def test_retriever_uses_bm25_while_embedding_model_loads():
+    class Loading(HashEmbedder):
+        def wait_time(self, texts):
+            return float("inf")
+
+        def unavailable_reason(self):
+            return "Local embedding model is still loading"
+
+    r = HybridRetriever(Loading(), InMemoryStore)
+    await r.index(_chunks())
+    hits = await r.search("Eiffel Tower Paris", k=1)
+    assert hits[0].id == "c-u3"
+    assert r.note == "Local embedding model is still loading; used keyword search for this step."

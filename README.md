@@ -36,10 +36,10 @@ Runs entirely on **free tiers** (Gemini / Groq + Tavily / DuckDuckGo) and deploy
 | Area | What it does |
 |---|---|
 | **Orchestration** | Planner → N parallel workers (`asyncio`, semaphore-bounded, per-worker timeout) → synthesizer |
-| **RAG** | Paragraph-aware chunking with overlap · Gemini embeddings · ChromaDB · BM25 · Reciprocal Rank Fusion · per-source diversity cap |
+| **RAG** | Paragraph-aware chunking with overlap · local MiniLM embeddings (ONNX, no API quota) · ChromaDB · BM25 · Reciprocal Rank Fusion · per-source diversity cap |
 | **Grounded citations** | Workers may only cite passage IDs they were shown; invalid IDs are stripped, unsupported claims dropped, report citations verified and renumbered |
 | **Context management** | Workers see only top-k retrieved passages, not whole pages; the synthesizer sees only distilled claims, not raw text |
-| **Error recovery** | Retries with backoff + `Retry-After` · LLM provider failover · JSON self-repair · search fallback · snippet fallback · BM25-only fallback · partial reports |
+| **Error recovery** | Retries with backoff + `Retry-After` · LLM provider failover · JSON self-repair · search fallback · snippet fallback · BM25-only fallback · latency budgets for optional stages · partial reports |
 | **Free-tier aware** | Quota-aware load balancing across models (each has its own limit) · paces requests, tokens and output tokens per model · per-visitor daily quota · bring-your-own-key |
 | **Observability** | Live progress events, token / call / page stats, full JSON trace of plan, findings and evidence |
 | **Testable offline** | `--mock` mode with a fake LLM and search: the whole pipeline runs with no keys and no network |
@@ -81,7 +81,7 @@ streamlit run app.py
 | Key | Where | Needed? |
 |---|---|---|
 | `GROQ_API_KEY` | [console.groq.com/keys](https://console.groq.com/keys) → *Create API Key* | Recommended main LLM (fast, `openai/gpt-oss-120b`) |
-| `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) → *Create API key* | Recommended: embeddings for RAG, plus backup LLM |
+| `GEMINI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) → *Create API key* | Optional backup LLM (and API embeddings if you choose them) |
 | `TAVILY_API_KEY` | [app.tavily.com](https://app.tavily.com) → copy the key on the dashboard | Optional; better search than the DuckDuckGo fallback |
 
 None of these need a credit card. Free-tier limits change over time; if you hit 429 errors, lower
@@ -131,7 +131,7 @@ research_agent/
   mock.py            offline LLM + search doubles
   cli.py             rich terminal UI
 app.py               Streamlit web app
-tests/               39 tests: RAG, agents, failure modes, end-to-end, UI
+tests/               44 tests: RAG, agents, failure modes, end-to-end, UI
 ```
 
 ## Performance on free tiers
@@ -149,6 +149,9 @@ planning and the final report still prefer the strongest model.
 Measured live with fresh quota; back-to-back runs share the same per-minute budget and take longer.
 
 Lessons found in live runs, each now handled in code and covered by a test:
+- Gemini's free embedding tier counts **every text as a request, ~1,000 a day**: about a dozen reports. The deployed
+  app stalled on it (250 s per report), so embeddings now run locally (MiniLM via ONNX, ~2 s for 64 passages),
+  preloaded at app start, with a latency budget that uses BM25 rather than waiting on any slow optional stage.
 - `qwen3` has a separate **1,000 output-tokens/minute** cap, so requests are clamped and long outputs are routed elsewhere.
 - Quota must be tracked **per process, not per run**, or the second visitor's run thinks the quota is fresh.
 - `gpt-oss` cites as `【1】`, so citations are normalised before verification.
@@ -164,8 +167,9 @@ Lessons found in live runs, each now handled in code and covered by a test:
   which BM25 matches exactly and embeddings blur. RRF fuses both without score calibration.
 - **Citations are enforced in code, not just requested in prompts.** The model can only cite IDs it was
   shown, and anything else is removed before the user sees it.
-- **Embeddings through an API by default.** Free hosts have ~1 GB of RAM; an API keeps the app light.
-  Set `EMBEDDING_BACKEND=local` and `pip install .[local]` to run sentence-transformers instead.
+- **Local embeddings by default.** A free embedding API sounds lighter, but its daily quota caps the whole app at
+  ~12 reports. ONNX MiniLM ships with ChromaDB, needs no extra dependency, and fits a free host's RAM.
+  `EMBEDDING_BACKEND=gemini` switches to the API; `local` runs any sentence-transformers model.
 
 ## Tests
 

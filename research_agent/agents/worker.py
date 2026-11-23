@@ -97,9 +97,11 @@ class Worker:
         retriever = HybridRetriever(self.embedder, self.store_factory)
         try:
             await retriever.index(chunks)
-            if retriever.warning:
-                await self._say(Stage.WARNING, wid, retriever.warning)
+
             evidence = await self._retrieve(retriever, sq)
+            for msg in (retriever.warning, retriever.note):
+                if msg:
+                    await self._say(Stage.WARNING, wid, msg)
         finally:
             retriever.close()
         await self._say(

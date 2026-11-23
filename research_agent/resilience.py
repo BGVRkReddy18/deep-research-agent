@@ -114,6 +114,7 @@ async def retry_async(
     max_delay: float = 20.0,
     is_retryable: Callable[[BaseException], bool] = lambda e: not isinstance(e, PermanentError),
     retry_after: Callable[[BaseException], float | None] = retry_after_hint,
+    max_wait: float | None = None,
     label: str = "call",
 ) -> T:
     """Run `fn` with exponential backoff + jitter. Honors server Retry-After hints."""
@@ -123,11 +124,12 @@ async def retry_async(
             return await fn()
         except Exception as exc:
             last = exc
-            if attempt == attempts or not is_retryable(exc):
-                raise
             hinted = retry_after(exc)
             delay = hinted if hinted is not None else min(max_delay, base_delay * 2 ** (attempt - 1))
             delay += random.uniform(0, 0.5)
+            # Give up instead of waiting longer than the caller's latency budget allows.
+            if attempt == attempts or not is_retryable(exc) or (max_wait is not None and delay > max_wait):
+                raise
             log.warning("%s failed (%s), retry %d/%d in %.1fs", label, exc, attempt, attempts - 1, delay)
             await asyncio.sleep(delay)
     assert last is not None

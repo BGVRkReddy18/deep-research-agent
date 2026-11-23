@@ -166,7 +166,18 @@ def show_report(report: Report) -> None:
 
 # ---------------------------------------------------------------- page
 
+@st.cache_resource
+def _warm_up_embeddings() -> bool:
+    """Start loading the local embedding model when the app boots, not on the first question."""
+    if get_settings().embedding_backend.lower() == "onnx":
+        from research_agent.rag.embeddings import OnnxEmbedder
+
+        OnnxEmbedder.warm_up_in_background()
+    return True
+
+
 def main() -> None:
+    _warm_up_embeddings()
     base = get_settings()
     server_has_llm = any(build_provider(name) for name in PROVIDER_PRESETS)
 

@@ -142,8 +142,9 @@ class Settings:
         )
     )
 
-    # Embeddings: "gemini" (free API, low RAM), "local" (sentence-transformers), or "hash" (offline).
-    embedding_backend: str = field(default_factory=lambda: _env("EMBEDDING_BACKEND", "gemini"))
+    # Embeddings: "onnx" (local MiniLM, no quota; default), "gemini" (free API, ~1,000 texts/day),
+    # "local" (any sentence-transformers model), or "hash" (offline, for tests).
+    embedding_backend: str = field(default_factory=lambda: _env("EMBEDDING_BACKEND", "onnx"))
     gemini_embedding_model: str = field(
         default_factory=lambda: _env("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
     )

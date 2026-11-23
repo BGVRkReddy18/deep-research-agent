@@ -83,6 +83,14 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
 
     components = None
+    if not args.mock and settings.embedding_backend.lower() == "onnx":
+        from .rag.embeddings import OnnxEmbedder
+
+        with console.status("Loading local embedding model (one-time download ~80 MB on first use)…"):
+            try:
+                OnnxEmbedder._load()
+            except Exception as exc:  # noqa: BLE001 - research still works with BM25 only
+                console.print(f"[yellow]Embedding model unavailable ({exc}); using keyword search only.[/]")
     if args.mock:
         from .mock import mock_components
 

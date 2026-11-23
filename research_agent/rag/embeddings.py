@@ -1,7 +1,8 @@
 """Embedding backends.
 
-* GeminiEmbedder - free Gemini embedding API (default; no model in RAM, ideal for free hosting)
-* LocalEmbedder  - sentence-transformers running on CPU (optional extra: `pip install .[local]`)
+* OnnxEmbedder   - all-MiniLM-L6-v2 on CPU via ONNX Runtime (default; no API, no quota)
+* GeminiEmbedder - Gemini embedding API (free tier: ~100 texts/min, ~1,000/day)
+* LocalEmbedder  - any sentence-transformers model (optional extra: `pip install .[local]`)
 * HashEmbedder   - deterministic feature hashing; no network, used for --mock and tests
 """
 
@@ -9,14 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import math
 import re
+import threading
 from typing import Protocol
 
 import numpy as np
 from openai import AsyncOpenAI
 
 from ..resilience import RateLimiter, estimate_tokens, retry_async
+
+log = logging.getLogger(__name__)
 
 
 class Embedder(Protocol):
@@ -44,21 +49,40 @@ class GeminiEmbedder:
 
     BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
     BATCH = 32
-    MAX_CHARS = 1200
+    MAX_CHARS = 800  # ~200 tokens: the opening of a passage carries most of its meaning
+    MAX_RETRY_WAIT = 8.0  # embeddings are optional (BM25 is the fallback), so never stall long
+
+    # Quota trackers and vector cache are process-wide, keyed by (model, key), because the API's
+    # quota is shared by every research run in this process (e.g. all visitors of the web app).
+    _shared: dict[tuple[str, str], tuple[RateLimiter, RateLimiter, dict[str, np.ndarray]]] = {}
 
     def __init__(
         self, api_key: str, model: str = "gemini-embedding-001", texts_per_minute: int = 90, tokens_per_minute: int = 25_000
     ) -> None:
         self.name = f"gemini:{model}"
         self._model = model
-        self._client = AsyncOpenAI(api_key=api_key, base_url=self.BASE_URL, timeout=60.0, max_retries=0)
-        self._text_limiter = RateLimiter(texts_per_minute)
-        self._token_limiter = RateLimiter(tokens_per_minute)
-        self._cache: dict[str, np.ndarray] = {}
+        self._client = AsyncOpenAI(api_key=api_key, base_url=self.BASE_URL, timeout=30.0, max_retries=0)
+        key = (model, hashlib.sha256(api_key.encode()).hexdigest()[:16])
+        if key not in self._shared:
+            self._shared[key] = (RateLimiter(texts_per_minute), RateLimiter(tokens_per_minute), {})
+        self._text_limiter, self._token_limiter, self._cache = self._shared[key]
+
+    def _missing(self, texts: list[str]) -> list[str]:
+        return list(dict.fromkeys(t[: self.MAX_CHARS] for t in texts if t[: self.MAX_CHARS] not in self._cache))
+
+    def wait_time(self, texts: list[str]) -> float:
+        """Seconds the free-tier quota would make us wait to embed `texts` (0 = right now)."""
+        missing = self._missing(texts)
+        if not missing:
+            return 0.0
+        return max(
+            self._text_limiter.wait_time(len(missing)),
+            self._token_limiter.wait_time(sum(estimate_tokens(t) for t in missing)),
+        )
 
     async def embed(self, texts: list[str]) -> np.ndarray:
         clipped = [t[: self.MAX_CHARS] for t in texts]
-        missing = list(dict.fromkeys(t for t in clipped if t not in self._cache))
+        missing = self._missing(texts)
         for start in range(0, len(missing), self.BATCH):
             batch = missing[start : start + self.BATCH]
 
@@ -73,11 +97,85 @@ class GeminiEmbedder:
                     raise ValueError(f"expected {len(batch)} embeddings, got {len(data)}")
                 return [d.embedding for d in data]
 
-            vectors = _normalise(np.array(await retry_async(call, attempts=3, label="gemini-embed")))
+            vectors = _normalise(
+                np.array(await retry_async(call, attempts=2, max_wait=self.MAX_RETRY_WAIT, label="gemini-embed"))
+            )
             self._cache.update(zip(batch, vectors, strict=True))
         if not clipped:
             return np.zeros((0, 1), dtype=np.float32)
         return np.stack([self._cache[t] for t in clipped])
+
+
+class OnnxEmbedder:
+    """all-MiniLM-L6-v2 running locally via ONNX Runtime (bundled with ChromaDB).
+
+    The default backend: no API key, no quota, ~2s for 64 passages on a laptop CPU. Why not an
+    embedding API? Gemini's free tier counts every text as a request and allows only ~1,000 a
+    day, about a dozen reports. The model (~80 MB) downloads once; while it loads, `wait_time`
+    reports it as busy so the retriever uses BM25 instead of stalling a visitor's request.
+    """
+
+    name = "onnx:all-MiniLM-L6-v2"
+    MAX_CHARS = 1000  # the model reads at most 256 word-pieces anyway
+
+    _fn = None
+    _lock = threading.Lock()
+    _loader: threading.Thread | None = None
+    load_error: str | None = None
+
+    @classmethod
+    def _load(cls) -> None:
+        with cls._lock:
+            if cls._fn is None:
+                from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+                fn = ONNXMiniLM_L6_V2()
+                fn(["warm up"])  # first call downloads + initialises the model
+                cls._fn = fn
+
+    @classmethod
+    def warm_up_in_background(cls) -> None:
+        if cls._fn is not None or (cls._loader is not None and cls._loader.is_alive()):
+            return
+
+        def run() -> None:
+            try:
+                cls._load()
+            except Exception as exc:  # noqa: BLE001 - retrieval falls back to BM25
+                cls.load_error = f"{type(exc).__name__}: {exc}"
+                log.warning("local embedding model failed to load: %s", exc)
+
+        cls._loader = threading.Thread(target=run, name="embedding-warmup", daemon=True)
+        cls._loader.start()
+
+    def __init__(self) -> None:
+        self.warm_up_in_background()
+
+    @property
+    def ready(self) -> bool:
+        return type(self)._fn is not None
+
+    def unavailable_reason(self) -> str | None:
+        if self.ready:
+            return None
+        if type(self).load_error:
+            self.warm_up_in_background()  # try again later
+            return "Local embedding model failed to load"
+        return "Local embedding model is still loading"
+
+    def wait_time(self, texts: list[str]) -> float:
+        return 0.0 if self.ready else float("inf")
+
+    async def embed(self, texts: list[str]) -> np.ndarray:
+        if not self.ready:
+            await asyncio.to_thread(self._load)
+        clipped = [t[: self.MAX_CHARS] for t in texts]
+
+        def run() -> list:
+            with type(self)._lock:  # one inference at a time: predictable CPU and memory use
+                return type(self)._fn(clipped)
+
+        return _normalise(np.array(await asyncio.to_thread(run)))
 
 
 class LocalEmbedder:
@@ -117,6 +215,8 @@ class HashEmbedder:
 
 def build_embedder(backend: str, *, gemini_key: str, gemini_model: str, local_model: str) -> Embedder:
     backend = backend.lower()
+    if backend == "onnx":
+        return OnnxEmbedder()
     if backend == "local":
         return LocalEmbedder(local_model)
     if backend == "gemini" and gemini_key:
