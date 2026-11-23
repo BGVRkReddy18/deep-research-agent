@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.egg-info/
+.env
+reports/
+.pytest_cache/
+.ruff_cache/
+.streamlit/secrets.toml
